@@ -1,226 +1,102 @@
+"""
+For each tick granularity, and for each instrument, calculate technical indicators:
+1. 5 day moving average of price
+2. 20 days moving average of high and low
+3. RSI
+4. On Balance volume
+5. MACD
+6. Rate of change
+7. Stochasstic oscillator
+8. Commodity channel index
+
+Where appropriate, calculate the percentage distance away from the indicator instead of an absolute value
+"""
+
 from pymongo import MongoClient
 import pandas as pd
-from datetime import datetime
-import yfinance as yf
 import ta
+from tqdm import tqdm
 
 class FeatureEngineer:
-    def __init__(self, db_uri='mongodb://localhost:27017/', db_name='crypto_data'):
-        self.client = MongoClient(db_uri)
+    def __init__(self, db_name):
+        self.client = MongoClient()
         self.db = self.client[db_name]
+        self.master_collection = 'crypto_candles_one_minute'
+        self.collection_names = [
+            'crypto_candles_fifteen_minute',
+            'crypto_candles_five_minute',
+            'crypto_candles_one_day',
+            'crypto_candles_one_hour',
+            'crypto_candles_one_minute',
+            'crypto_candles_six_hour',
+            'crypto_candles_thirty_minute',
+            'crypto_candles_two_hour'
+        ]
 
-    def fetch_financial_data(self, ticker_symbol, start_date, end_date):
-        ticker = yf.Ticker(ticker_symbol)
-        data = ticker.history(start=start_date, end=end_date, interval="1D")
-        return pd.DataFrame(data).reset_index()
-
-    def fetch_table_data(self, collection_name):
-        collection = self.db[collection_name]
-        cursor = collection.find({}, {'_id': 0, 'Date': 1, 'Close': 1}).sort('Date', -1)
-        df = pd.DataFrame(list(cursor))
-        print(df)
-        df['Date'] = pd.to_datetime(df['Date'], utc=True).dt.date
-        return df.set_index('Date')
-
-    def calculate_differences_and_momentum(self, df, intervals):
-        for interval in intervals:
-            df[f'Momentum_{interval}d'] = df['Close'].diff(periods=interval) / df['Close'].shift(periods=interval)
-            df[f'Momentum_ROC_{interval}d'] = df[f'Momentum_{interval}d'].diff() / interval
-            df[f'Close_diff_{interval}d'] = df['Close'].diff(periods=interval)
-            df[f'Close_diff_{interval}d_bps'] = df[f'Close_diff_{interval}d'] / df['Close'].shift(periods=interval) * 10000
-        return df
-
-    def create_breadth_df(self, intervals):
-        table_names = ['BTC_daily', 'ETH_daily', 'SP500_daily', 'VIX_daily', 'Magnificent7_Index_daily']
-        breadth_df = pd.DataFrame()
-
-        for collection_name in table_names:
-            df = self.fetch_table_data(collection_name)
-            df = self.calculate_differences_and_momentum(df, intervals)
-            for interval in intervals:
-                breadth_df[f'{collection_name}_Momentum_{interval}d'] = df[f'Momentum_{interval}d']
-
-        breadth_df.fillna(method='bfill', inplace=True)
-        return breadth_df
+    def get_master_list(self):
+        collection = self.db[self.master_collection]
+        master_data = pd.DataFrame(list(collection.find({}, {'start': 1, 'instrument': 1})))
+        return master_data.drop_duplicates()
     
-    ### HIGH-LOW
-    def calculate_btc_and_instrument_high_low(self, collection_name):
+    def fetch_data(self, collection_name):
         collection = self.db[collection_name]
-        btc_data = pd.DataFrame(list(collection.find({'instrument': 'BTC-USDC'})))
-        instruments_data = pd.DataFrame(list(collection.find({'instrument': {'$ne': 'BTC-USDC'}})))
+        data = pd.DataFrame(list(collection.find()))
+        numeric_cols = ['close', 'high', 'low', 'volume']
+        for col in numeric_cols:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+        return data
 
-        for instrument_data in instruments_data:
-            btc_high_low = next((data for data in btc_data if data['start'] == instrument_data['start']), None)
-            if btc_high_low:
-                high_btc = btc_high_low['high']
-                low_btc = btc_high_low['low']
+    def calculate_indicators(self, df):
+        def calculate_group_indicators(group):
+            group['5d_ma'] = group['close'].rolling(window=5).mean()
+            group['20d_ma_high'] = group['high'].rolling(window=20).mean()
+            group['20d_ma_low'] = group['low'].rolling(window=20).mean()
+            group['rsi'] = ta.momentum.RSIIndicator(group['close']).rsi()
+            group['obv'] = ta.volume.OnBalanceVolumeIndicator(group['close'], group['volume']).on_balance_volume()
+            macd = ta.trend.MACD(group['close'])
+            group['macd'] = macd.macd()
+            group['macd_signal'] = macd.macd_signal()
+            group['roc'] = ta.momentum.ROCIndicator(group['close']).roc()
+            stoch = ta.momentum.StochasticOscillator(group['high'], group['low'], group['close'])
+            group['stoch_k'] = stoch.stoch()
+            group['stoch_d'] = stoch.stoch_signal()
+            group['cci'] = ta.trend.CCIIndicator(group['high'], group['low'], group['close']).cci()
+            return group
+
+        return df.groupby('instrument').apply(calculate_group_indicators)
+
+    def fetch_and_process_data(self, collection_name):
+        granularity = collection_name.split('_')[-2]  # Extract granularity from collection name
+        data = self.fetch_data(collection_name)
+        data['granularity'] = granularity  # Add granularity as a column
+        processed_data = self.calculate_indicators(data)
+        return processed_data
+
+    def process_and_aggregate(self, master_list):
+        aggregated_data = pd.DataFrame()  # Initialize empty DataFrame for aggregated data
+        for collection_name in tqdm(self.collection_names, desc='Processing Collections'):
+            data = self.fetch_and_process_data(collection_name)
+            if aggregated_data.empty:
+                aggregated_data = data
             else:
-                high_btc = None
-                low_btc = None
-
-            record = {
-                'start': instrument_data['start'],
-                'instrument': instrument_data['instrument'],
-                'high': instrument_data['high'],
-                'low': instrument_data['low'],
-                'high_btc': high_btc,
-                'low_btc': low_btc,
-                'end': instrument_data['end']
-            }
-            self.db['instr_high_low'].insert_one(record)
-
-    ###
-    def calculate_btc_and_instrument_volatility(self, collection_name, timeframes):
-        collection = self.db[collection_name]
-        btc_data = pd.DataFrame(list(collection.find({'instrument': 'BTC-USDC'})))
-        other_instruments_data = pd.DataFrame(list(collection.find({'instrument': {'$ne': 'BTC-USDC'}})))
-
-        # Prepare an empty DataFrame to store volatility results
-        volatility_results = pd.DataFrame()
-
-        # Loop over all timeframes to calculate volatility
-        for timeframe in timeframes:
-            # Calculate rolling standard deviation for BTC
-            btc_data[f'volatility_{timeframe}d'] = btc_data['close'].rolling(window=timeframe, min_periods=1).std()
-
-            # Calculate volatility for each other instrument and compare with BTC
-            for index, row in other_instruments_data.iterrows():
-                instrument_name = row['instrument']
-                instrument_data = other_instruments_data[other_instruments_data['instrument'] == instrument_name]
-                instrument_data[f'volatility_{timeframe}d'] = instrument_data['close'].rolling(window=timeframe, min_periods=1).std()
-
-                # Compare instrument volatility with BTC and store in the results DataFrame
-                instrument_data[f'volatility_vs_btc_{timeframe}d'] = instrument_data[f'volatility_{timeframe}d'] - btc_data.iloc[0][f'volatility_{timeframe}d']
-                volatility_results = pd.concat([volatility_results, instrument_data])
-
-        # Update MongoDB with the volatility results
-        for index, row in volatility_results.iterrows():
-            collection.update_one({'_id': row['_id']}, {'$set': row.to_dict()}, upsert=True)
-    
-    ###
-    def calculate_momentum(self, data, timeframes, is_instr=True):
-        for timeframe in timeframes:
-            momentum_key = f'instr_momentum_{timeframe}min' if is_instr else f'btc_momentum_{timeframe}min'
-            data['close'] = pd.to_numeric(data['close'])
-            data[momentum_key] = data['close'].pct_change(periods=timeframe)
-            data[momentum_key].fillna(method='bfill', inplace=True)
-        return data
-
-    def calculate_and_store_momentum(self, collection_name, timeframes):
-        collection = self.db[collection_name]
-        instruments_data = list(collection.find({}))
-
-        for instrument_data in instruments_data:
-            instrument_df = pd.DataFrame(instrument_data)
-            for timeframe in timeframes:
-                instrument_df = self.calculate_momentum(instrument_df, [timeframe])
-
-                # Store the updated DataFrame back into MongoDB
-                for index, row in instrument_df.iterrows():
-                    collection.update_one({'_id': row['_id']}, {'$set': row.to_dict()})
-                
-    ###
-    def convert_to_numeric(self, df, column_names):
-        for column in column_names:
-            df[column] = pd.to_numeric(df[column], errors='coerce')
-        return df
-
-    def detect_crossover(self, data, column1, column2):
-        crossover_up = (data[column1] > data[column2]) & (data[column1].shift() < data[column2].shift())
-        crossover_down = (data[column1] < data[column2]) & (data[column1].shift() > data[column2].shift())
-        data[f'{column1}_cross_{column2}_up'] = crossover_up
-        data[f'{column1}_cross_{column2}_down'] = crossover_down
-
-    def calculate_indicators(self, data, max_window):
-        window = min(len(data), max_window)
-        numeric_columns = ['open', 'high', 'low', 'close']
-        data = self.convert_to_numeric(data, numeric_columns)
-
-        # Calculate technical indicators using 'ta' library
-        data['bb_bbm'] = ta.volatility.bollinger_mavg(data['close'], window=window, fillna=True)
-        data['bb_bbh'] = ta.volatility.bollinger_hband(data['close'], window=window, fillna=True)
-        data['bb_bbl'] = ta.volatility.bollinger_lband(data['close'], window=window, fillna=True)
-        data['sma'] = ta.trend.sma_indicator(data['close'], window=window, fillna=True)
-        data['ema'] = ta.trend.ema_indicator(data['close'], window=window, fillna=True)
-        data['rsi'] = ta.momentum.rsi(data['close'], window=window, fillna=True)
-        data['macd'] = ta.trend.macd(data['close'], fillna=True)
-        data['macd_signal'] = ta.trend.macd_signal(data['close'], fillna=True)
+                aggregated_data = pd.concat([aggregated_data, data], ignore_index=True)
         
-        # Ichimoku
-        ichimoku = ta.trend.IchimokuIndicator(high=data['high'], low=data['low'], window1=window, window2=window*2, window3=window*4)
-        data[f'ichimoku_a_{window}'] = ichimoku.ichimoku_a()
-        data[f'ichimoku_b_{window}'] = ichimoku.ichimoku_b()
-        data[f'ichimoku_base_line_{window}'] = ichimoku.ichimoku_base_line()
-        data[f'ichimoku_conversion_line_{window}'] = ichimoku.ichimoku_conversion_line()
+        # After all data is aggregated, set 'start', 'instrument', and 'granularity' as index
+        aggregated_data.set_index(['start', 'instrument', 'granularity'], inplace=True)
+        
+        return aggregated_data
 
-        # Calculate percentage distance for each indicator
-        for col in ['bb_bbm', 'bb_bbh', 'bb_bbl', 'sma', 'ema', 'rsi', 'macd', 'macd_signal']:
-            data[f'{col}_pct_dist'] = (data[col] - data['close']) / data['close'] * 100
+    def store_in_mongodb(self, processed_data, collection_name='crypto_TA'):
+        collection = self.db[collection_name]
+        processed_data.reset_index(inplace=True)  # Reset index to store 'start', 'instrument', and 'granularity' as fields
+        records = processed_data.to_dict('records')
+        for record in records:
+            filter_ = {'start': record['start'], 'instrument': record['instrument'], 'granularity': record['granularity']}
+            update = {'$set': record}
+            collection.update_one(filter_, update, upsert=True)
 
-        # Detect crossovers
-        self.detect_crossover(data, 'macd', 'macd_signal')
-
-        return data
-
-    def calculate_indicators_for_all_instruments_and_granularities(self, max_window):
-        results = []
-
-        # Assuming you have a collection per instrument with documents containing 'granularity', 'start', and other required fields
-        for collection_name in self.db.list_collection_names():
-            collection = self.db[collection_name]
-            cursor = collection.find()
-            df = pd.DataFrame(list(cursor))
-
-            # Ensure data is sorted and indexed by 'start'
-            df.sort_values(by='start', ascending=True, inplace=True)
-            df.set_index('start', inplace=True)
-
-            # Convert necessary columns to numeric
-            df = self.convert_to_numeric(df, ['open', 'high', 'low', 'close'])
-
-            # Calculate indicators
-            df_with_indicators = self.calculate_indicators(df, max_window)
-
-            # Add instrument and granularity info
-            df_with_indicators['instrument'] = collection_name
-            df_with_indicators['granularity'] = df_with_indicators.apply(lambda x: self.get_granularity_from_collection(collection_name), axis=1)
-
-            results.append(df_with_indicators)
-
-        # Concatenate all results into a single DataFrame
-        final_data = pd.concat(results, ignore_index=True)
-
-        # You might want to save the processed data into a new collection in MongoDB
-        self.save_to_mongodb(final_data, 'processed_indicators')
-
-    def run_feature_engineering(self):
-        # Define the intervals for breadth_df calculation
-        intervals = [1, 2, 3, 7, 14, 21, 30]
-        # Calculate the breadth_df using MongoDB data
-        breadth_df = self.create_breadth_df(intervals)
-        print(breadth_df.head())
-        # Store breadth_df in a MongoDB collection if needed
-        breadth_collection = self.db['breadth_data']
-        records = breadth_df.to_dict('records')
-        breadth_collection.insert_many(records)
-
-        # Define timeframes for volatility and momentum calculations
-        timeframes = [1, 10, 15, 100, 300, 1000]  # Timeframes in days for volatility
-        self.calculate_btc_and_instrument_volatility('crypto_candles', timeframes)
-
-        timeframes = [1, 5, 7, 10, 14, 21, 30, 69, 90, 300, 1337]  # Timeframes for momentum
-        self.calculate_and_store_momentum('crypto_candles', timeframes)
-
-        # Define the maximum window for technical indicators calculation
-        max_window = 15*60  # Example with a 14-period window
-        # Calculate indicators for all instruments and granularities using MongoDB data
-        indicators_data = self.calculate_indicators_for_all_instruments_and_granularities('crypto_candles', max_window)
-        print(indicators_data)
-        # Optionally, store the indicators_data in MongoDB
-        indicators_collection = self.db['instrument_indicators']
-        indicators_records = indicators_data.to_dict('records')
-        indicators_collection.insert_many(indicators_records)
-
-    def __del__(self):
-        self.client.close()
-    
+    def run(self):
+        master_list = self.get_master_list()
+        aggregated_data = self.process_and_aggregate(master_list)
+        self.store_in_mongodb(aggregated_data)
+        print("Aggregated data stored in 'crypto_TA' collection.")
