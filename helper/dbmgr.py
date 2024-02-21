@@ -7,6 +7,7 @@ from helper.machinelearner import *
 from functools import partial
 from pymongo import *
 import pymongo
+from tqdm import tqdm  
 
 class DatabaseManager:
     def __init__(self, db_uri='mongodb://localhost:27017/', db_name='crypto_data', start_time=None, end_time=None):
@@ -15,15 +16,13 @@ class DatabaseManager:
         self.start_time = start_time
         self.end_time = end_time
         self.granularities = [
-            "ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "THIRTY_MINUTE",
+            "FIFTEEN_MINUTE", "THIRTY_MINUTE",
             "ONE_HOUR", "TWO_HOUR", "SIX_HOUR", "ONE_DAY"
         ]
     
     @staticmethod
     def generate_expected_timestamps(start_time, end_time, granularity):
         granularity_mapping = {
-            'ONE_MINUTE': 1,
-            'FIVE_MINUTE': 5,
             'FIFTEEN_MINUTE': 15,
             'THIRTY_MINUTE': 30,
             'ONE_HOUR': 60,
@@ -40,8 +39,6 @@ class DatabaseManager:
     @staticmethod
     def calculate_end_time(start, granularity):
         granularities = {
-            "ONE_MINUTE": timedelta(minutes=1),
-            "FIVE_MINUTE": timedelta(minutes=5),
             "FIFTEEN_MINUTE": timedelta(minutes=15),
             "THIRTY_MINUTE": timedelta(minutes=30),
             "ONE_HOUR": timedelta(hours=1),
@@ -50,11 +47,9 @@ class DatabaseManager:
             "ONE_DAY": timedelta(days=1)
         }
         return start + granularities.get(granularity, timedelta(0))
-    
+
     def fetch_and_store_data(pid, granularity, db_name, db_uri, start_time, end_time):
         granularity_mapping = {
-            'ONE_MINUTE': 1,
-            'FIVE_MINUTE': 5,
             'FIFTEEN_MINUTE': 15,
             'THIRTY_MINUTE': 30,
             'ONE_HOUR': 60,
@@ -66,89 +61,33 @@ class DatabaseManager:
         db = client[db_name]
         collection = db[f"crypto_candles_{granularity.lower()}"]
 
-        def identify_gaps(missing_timestamps):
-            gaps = []
-            gap_start = missing_timestamps[0]
+        # Ensure the collection has the required index
+        collection.create_index([('instrument', pymongo.ASCENDING), ('granularity', pymongo.ASCENDING), ('start', pymongo.ASCENDING)], unique=True)
 
-            for i in range(1, len(missing_timestamps)):
-                if missing_timestamps[i] - missing_timestamps[i-1] > timedelta(minutes=granularity_mapping[granularity]):
-                    gap_end = missing_timestamps[i-1]
-                    gaps.append((gap_start, gap_end))
-                    gap_start = missing_timestamps[i]
+        # Fetch data for the entire time period without checking for missing timestamps
+        df = CoinbaseClient(api_key, api_secret).get_product_candles(pid, start_time, end_time, granularity)
 
-            # Add the last gap
-            gaps.append((gap_start, missing_timestamps[-1]))
-            return gaps
-
-        # Generate expected timestamps
-        expected_timestamps = list(DatabaseManager.generate_expected_timestamps(start_time, end_time, granularity))
-
-        # Find missing timestamps
-        existing_documents = collection.find(
-            {'instrument': pid, 'start': {'$gte': start_time, '$lt': end_time}},
-            {'start': 1, '_id': 0}
-        )
-        existing_timestamps = [doc['start'] for doc in existing_documents]
-        missing_timestamps = sorted(set(expected_timestamps) - set(existing_timestamps))
-
-        # Identify gaps (missing periods) and fetch data for each gap
-        gaps = identify_gaps(missing_timestamps)
-        for gap in tqdm(gaps, desc='Fetching data for gaps'):
-            gap_start, gap_end = gap
-            df = CoinbaseClient(api_key, api_secret).get_product_candles(pid, gap_start, gap_end, granularity)
-
-        if missing_timestamps:
-            # Determine the range for missing data
-            missing_start = missing_timestamps[0]
-            missing_end = missing_timestamps[-1] + timedelta(minutes=granularity_mapping[granularity])
-
-            # Fetch data for the range of missing timestamps
-            df = CoinbaseClient(api_key, api_secret).get_product_candles(pid, missing_start, missing_end, granularity)
-
-            if not df.empty:
-                # Process and store each candle
-                for _, row in df.iterrows():
-                    record = {
-                        'instrument': pid,
-                        'granularity': granularity,
-                        'start': row['start'],
-                        'end': row['start'] + timedelta(minutes=granularity_mapping[granularity]),
-                        'open': row['open'],
-                        'close': row['close'],
-                        'high': row['high'],
-                        'low': row['low'],
-                        'volume': row['volume']
-                    }
-                    collection.update_one(
-                        {'instrument': pid, 'start': record['start']},
-                        {'$set': record},
-                        upsert=True
-                    )
-        
-        # Fetch the last document before the missing period for forward filling
-        last_doc = collection.find_one({'instrument': pid, 'start': {'$lt': missing_timestamps[0]}}, sort=[('start', pymongo.DESCENDING)])
-
-        for missing_timestamp in missing_timestamps:
-            # Create a new document with forward-filled price data and zero volume
-            new_doc = {
-                'instrument': pid,
-                'granularity': granularity,
-                'start': missing_timestamp,
-                'end': missing_timestamp + timedelta(minutes=granularity_mapping[granularity]),
-                'open': last_doc['open'],
-                'close': last_doc['close'],
-                'high': last_doc['high'],
-                'low': last_doc['low'],
-                'volume': 0
-            }
-
-            # Insert the new document into the collection
-            collection.insert_one(new_doc)
-
-            # Update the last_doc for the next iteration
-            last_doc = new_doc
-            
+        if not df.empty:
+            # Process and store each candle
+            for _, row in df.iterrows():
+                record = {
+                    'instrument': pid,
+                    'granularity': granularity,
+                    'start': row['start'],
+                    'end': row['start'] + timedelta(minutes=granularity_mapping[granularity]),
+                    'open': row['open'],
+                    'close': row['close'],
+                    'high': row['high'],
+                    'low': row['low'],
+                    'volume': row['volume']
+                }
+                collection.update_one(
+                    {'instrument': pid, 'start': record['start']},
+                    {'$set': record},
+                    upsert=True
+                )
         client.close()
+
 
     def main(self, unique_pids):
         print("Preparing to fetch and store data...")
@@ -162,7 +101,6 @@ class DatabaseManager:
 
         print("All data fetching tasks completed.")
 
-    
     def check_row_counts(self):
         client = MongoClient(self.db_uri)
         db = client[self.db_name]
