@@ -6,6 +6,7 @@ from sklearn.preprocessing import MinMaxScaler
 from statsmodels.tsa.stattools import adfuller
 import numpy as np
 from pymongo import UpdateOne
+import os
 
 class FeatureEngineer:
     """
@@ -122,21 +123,17 @@ class FeatureEngineer:
         # Convert DataFrame to list of dictionaries
         records = processed_data.to_dict('records')
 
-        # Prepare bulk update operations
-        updates = [
-            UpdateOne(
-                {'start': record['start'], 'instrument': record['instrument'], 'granularity': record['granularity']},
-                {'$set': record},
-                upsert=True
-            )
-            for record in records
-        ]
+        updates = []
+        for record in records:
+            # Exclude '_id' field from the record if it exists
+            record.pop('_id', None)
+            record.pop('index', None)
+            
+            filter_ = {'start': record['start'], 'instrument': record['instrument'], 'granularity': record['granularity']}
+            updates.append(UpdateOne(filter_, {'$set': record}, upsert=True))
 
-        # Execute bulk update
         if updates:
             collection.bulk_write(updates)
-        else:
-            print("No updates to perform.")
 
     def run(self):
         master_list = self.get_master_list()
@@ -150,48 +147,83 @@ class DataPreparator(FeatureEngineer):
         super().__init__(db_name)
 
     def retrieve_and_prepare_data(self):
-        # Retrieve 15-minute candles
         fifteen_min_candles = self.fetch_data('crypto_candles_fifteen_minute')
+        fifteen_min_candles.fillna(method='bfill', inplace=True)
+        fifteen_min_candles.fillna(method='ffill', inplace=True)
 
-        # Retrieve TA indicators for all granularities and join them
-        ta_data = pd.DataFrame()
-        for collection_name in self.collection_names:
-            granularity_data = self.fetch_and_process_data(collection_name)
-            if ta_data.empty:
-                ta_data = granularity_data
-            else:
-                # Join on 'start' and 'instrument', ensuring alignment across different granularities
-                ta_data = pd.merge(ta_data, granularity_data, on=['start', 'instrument'], how='left')
+        final_data = fifteen_min_candles
 
-        # Merge 15-minute candles with TA indicators
-        final_data = pd.merge(fifteen_min_candles, ta_data, on=['start', 'instrument'], how='left')
+        # Dynamically get unique granularities from crypto_TA
+        granularities = self.db['crypto_TA'].distinct('granularity')
+
+        for granularity in granularities:
+            ta_data = self.db['crypto_TA'].find({'granularity': granularity})
+            ta_df = pd.DataFrame(list(ta_data))
+
+            # Drop the '_id' column from ta_df to prevent merge conflicts
+            ta_df.drop(columns=['_id', 'volume'], inplace=True, errors='ignore')
+
+            # Rename TA indicator columns to include granularity, and keep 'start', 'instrument'
+            ta_df.rename(columns=lambda x: f"{x}_{granularity}" if x not in ['start', 'instrument'] else x, inplace=True)
+
+            ta_df.fillna(method='bfill', inplace=True)
+            ta_df.fillna(method='ffill', inplace=True)
+
+            # Merge using custom suffixes to handle any remaining duplicate columns
+            final_data = pd.merge(final_data, ta_df, on=['start', 'instrument'], how='left', suffixes=('', f'_{granularity}'))
+        
+        # Check for columns with nulls and drop them
+        null_columns = final_data.columns[final_data.isnull().any()]
+        final_data.drop(null_columns, axis=1, inplace=True)
+
+        # Log dropped columns
+        logs_dir = 'Logs'
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+        with open(os.path.join(logs_dir, 'dropped_columns_log.txt'), 'w') as log_file:
+            log_file.write("Dropped columns due to nulls:\n")
+            log_file.write("\n".join(null_columns))
+
+        # Save the final DataFrame to the ML_features collection
+        self.db['ML_features'].insert_many(final_data.to_dict('records'))
 
         return final_data
+
 
     # Additional methods for labeling, scaling, and ensuring stationarity would go here
     def scale_data(self, df):
         scaler = MinMaxScaler()
         instruments = df['instrument'].unique()  # Assuming 'instrument' column identifies different instruments
+        
         for instrument in instruments:
-            instrument_data = df[df['instrument'] == instrument]
-            numerical_features = instrument_data.select_dtypes(include=[np.number]).columns.tolist()
-            instrument_data[numerical_features] = scaler.fit_transform(instrument_data[numerical_features])
-            df.update(instrument_data)
+            instrument_index = df[df['instrument'] == instrument].index  # Get the index of rows for the current instrument
+            numerical_features = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            # Scale numerical features for the current instrument
+            scaled_values = scaler.fit_transform(df.loc[instrument_index, numerical_features])
+            
+            # Assign the scaled values back using .loc to ensure direct assignment
+            df.loc[instrument_index, numerical_features] = scaled_values
+
         return df
+
   
     def label_data(self, df, profit_threshold=0.01):
-        # Assuming 'open' is the open price of the fifteen-minute candle and 'high' is the highest price in the next hour
+        # Convert 'close' to numeric, errors='coerce' will convert non-numeric values to NaN
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        
         for index, row in df.iterrows():
             future_candles = df.iloc[index + 1 : index + 5]  # Next four candles for the next hour
             if not future_candles.empty:
                 max_future_price = future_candles['high'].max()
-                if (max_future_price - row['open']) / row['open'] >= profit_threshold:
+                if max_future_price and row['close'] and (max_future_price - row['close']) / row['close'] >= profit_threshold:
                     df.at[index, 'label'] = 'BUY'
                 else:
                     df.at[index, 'label'] = 'PASS'
         return df
 
-    def check_stationarity(self, series, significance_level=0.05):
+
+    def check_stationarity(self, series, significance_level=0.01):
         result = adfuller(series.dropna())
         if result[1] < significance_level:
             return True  # Stationary
@@ -200,11 +232,28 @@ class DataPreparator(FeatureEngineer):
 
     def ensure_stationarity(self, df):
         non_stationary_columns = []
-        for column in df.columns:
-            if not self.check_stationarity(df[column]):
+        report = []
+
+        for column in df.select_dtypes(include=[np.number]).columns:
+            stationary = self.check_stationarity(df[column])
+            if not stationary:
                 non_stationary_columns.append(column)
-                # Implement logic to make the series stationary, e.g., differencing
+                report.append(f"Column {column} is non-stationary.")
+            else:
+                report.append(f"Column {column} is stationary.")
+
+        # Ensure 'Logs' directory exists
+        logs_dir = 'Logs'
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+
+        # Write the report to a text file
+        with open(os.path.join(logs_dir, 'stationarity_report.txt'), 'w') as file:
+            for line in report:
+                file.write(line + '\n')
+
         return df, non_stationary_columns
+
 
     def prepare_data(self):
         df = self.retrieve_and_prepare_data()
