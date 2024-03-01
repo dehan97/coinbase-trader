@@ -50,8 +50,6 @@ class FeatureEngineer:
         return data
 
     def calculate_group_indicators(self, group):
-        #NOTE CALCULATE VOLUME INDICATORS
-        # Calculate technical indicators for a given group (instrument)
         window = 30  # Define the rolling window size for indicators that need it
 
         # Moving averages
@@ -64,6 +62,23 @@ class FeatureEngineer:
 
         # OBV - On Balance Volume
         group['obv'] = ta.volume.OnBalanceVolumeIndicator(group['close'], group['volume']).on_balance_volume()
+
+        # ADL - Accumulation/Distribution Line
+        group['adl'] = ta.volume.AccDistIndexIndicator(group['high'], group['low'], group['close'], group['volume']).acc_dist_index()
+
+        # VWAP - Volume-Weighted Average Price (note: typically requires intraday data)
+        group['price_volume'] = group['close'] * group['volume']
+
+        # Extract date from 'start' timestamp
+        group['date'] = pd.to_datetime(group['start']).dt.date
+
+        volume_per_day = group.groupby(['date', 'instrument'])['volume'].transform('sum')
+        pv_sum_per_day = group.groupby(['date', 'instrument'])['price_volume'].transform('sum')
+        group['vwap'] = pv_sum_per_day / volume_per_day
+        
+
+        # CMF - Chaikin Money Flow
+        group['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(group['high'], group['low'], group['close'], group['volume'], window=20).chaikin_money_flow()
 
         # MACD - Moving Average Convergence Divergence
         macd = ta.trend.MACD(group['close'])
@@ -81,7 +96,8 @@ class FeatureEngineer:
         # CCI - Commodity Channel Index
         group['cci'] = ta.trend.CCIIndicator(group['high'], group['low'], group['close']).cci()
 
-        return group
+        return group.drop(columns=['date'])
+
 
     def calculate_indicators(self, df):
         # Apply calculate_group_indicators to each group and combine the results
@@ -93,6 +109,7 @@ class FeatureEngineer:
         granularity = collection_name.split('_')[-2]  # Extract granularity from collection name
         data = self.fetch_data(collection_name)
         data['granularity'] = granularity  # Add granularity as a column
+
         processed_data = self.calculate_indicators(data)
         return processed_data
 
@@ -109,7 +126,6 @@ class FeatureEngineer:
         aggregated_data.reset_index(inplace=True)
 
         return aggregated_data
-
 
     def store_in_mongodb(self, processed_data, collection_name='crypto_TA'):
         collection = self.db[collection_name]
@@ -189,8 +205,7 @@ class DataPreparator(FeatureEngineer):
 
         return final_data
 
-
-    # Additional methods for labeling, scaling, and ensuring stationarity would go here
+    # Additional methods for labeling, scaling, and checking stationarity 
     def scale_data(self, df):
         scaler = MinMaxScaler()
         instruments = df['instrument'].unique()  # Assuming 'instrument' column identifies different instruments
@@ -206,22 +221,6 @@ class DataPreparator(FeatureEngineer):
             df.loc[instrument_index, numerical_features] = scaled_values
 
         return df
-
-  
-    def label_data(self, df, profit_threshold=0.01):
-        # Convert 'close' to numeric, errors='coerce' will convert non-numeric values to NaN
-        df['close'] = pd.to_numeric(df['close'], errors='coerce')
-        
-        for index, row in df.iterrows():
-            future_candles = df.iloc[index + 1 : index + 5]  # Next four candles for the next hour
-            if not future_candles.empty:
-                max_future_price = future_candles['high'].max()
-                if max_future_price and row['close'] and (max_future_price - row['close']) / row['close'] >= profit_threshold:
-                    df.at[index, 'label'] = 'BUY'
-                else:
-                    df.at[index, 'label'] = 'PASS'
-        return df
-
 
     def check_stationarity(self, series, significance_level=0.01):
         result = adfuller(series.dropna())
@@ -257,7 +256,6 @@ class DataPreparator(FeatureEngineer):
 
     def prepare_data(self):
         df = self.retrieve_and_prepare_data()
-        df_labeled = self.label_data(df)
         df_scaled = self.scale_data(df_labeled)
         df_final, non_stationary_columns = self.ensure_stationarity(df_scaled)
         return df_final, non_stationary_columns

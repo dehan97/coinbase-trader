@@ -122,24 +122,23 @@ class LabelGenerator:
         instruments = self.get_instruments()
 
         for instrument in tqdm(instruments):
-            with sqlite3.connect(self.conn_string) as conn:
-                query = f"SELECT * FROM crypto_candles WHERE instrument = '{instrument}'"
-                chunk_iter = pd.read_sql_query(query, conn, chunksize=chunk_size)
+            # Fetch data from MongoDB collection for each instrument
+            df = self.fetch_data(instrument)
 
-                for chunk in chunk_iter:
-                    chunk = chunk.sort_values(by=['instrument', 'start'], ascending=True)
-                    unique_granularities = chunk['granularity'].unique()
+            # Sort the DataFrame if necessary
+            df = df.sort_values(by=['time'], ascending=True)  # Assume 'time' is the column for sorting
+            unique_granularities = self.granularities
 
-                    for granularity in unique_granularities:
-                        df_granularity = chunk[chunk['granularity'] == granularity]
+            for granularity in unique_granularities:
+                df_granularity = df[df['granularity'] == granularity]
 
-                        for window_size in [15, 30, 45, 60]:
-                            if not df_granularity.empty:
-                                result_df = self.calculate_targets(df_granularity.copy(), window_size)
-                                result_df['instrument'] = instrument
-                                result_df['granularity'] = granularity
-                                result_df['window_size'] = window_size
-                                yield result_df
+                for window_size in [15, 30, 45, 60]:
+                    if not df_granularity.empty:
+                        result_df = self.calculate_targets(df_granularity.copy(), window_size)
+                        result_df['instrument'] = instrument
+                        result_df['granularity'] = granularity
+                        result_df['window_size'] = window_size
+                        yield result_df
 
     def create_complete_index(self, df):
         all_start_dates = pd.date_range(start=df['start'].min(), end=df['start'].max(), freq='T')
@@ -160,13 +159,11 @@ class LabelGenerator:
         df = pd.DataFrame(list(cursor))
         return df
 
-    def data_exists_in_database(self, table_name):
-        conn = sqlite3.connect('features.db')
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
-        exists = bool(cursor.fetchone())
-        conn.close()
+    def data_exists_in_database(self, collection_name):
+        collection_list = self.db.list_collection_names()  # Get the list of collection names
+        exists = collection_name in collection_list  # Check if the collection name exists in the list
         return exists
+
     
 ###
 #https://stackoverflow.com/questions/48034035/how-to-consistently-hot-encode-dataframes-with-changing-values
