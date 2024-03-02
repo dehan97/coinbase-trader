@@ -65,7 +65,8 @@ class CoinbaseClient:
     
     def get_unique_product_ids(self):
         products_json = self.get_products()
-        product_ids = [product['product_id'] for product in products_json['products']]
+        # product_ids = [product['product_id'] for product in products_json['products']]
+        product_ids = ['BTC']
 
         uniq_product_ids = set()
         for p in product_ids:
