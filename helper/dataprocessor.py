@@ -200,8 +200,11 @@ class DataPreparator(FeatureEngineer):
             log_file.write("Dropped columns due to nulls:\n")
             log_file.write("\n".join(null_columns))
 
-        # Save the final DataFrame to the ML_features collection
-        self.db['ML_features'].insert_many(final_data.to_dict('records'))
+        for record in final_data.to_dict('records'):
+            # Use the combination of fields that uniquely identify each document, such as 'instrument' and 'start'
+            filter_ = {'instrument': record['instrument'], 'start': record['start']}
+            update = {'$set': record}
+            self.db['ML_features'].update_one(filter_, update, upsert=True)
 
         return final_data
 
@@ -265,6 +268,7 @@ class LabelGenerator:
                  db_name='crypto_data', 
                  account_value=5000, tx_fee=0.006, profit_level=0.003):
         self.client = MongoClient(mongo_uri)
+        self.db_name = db_name
         self.db = self.client[db_name]
         self.account_value = account_value
         self.tx_fee = tx_fee
@@ -275,12 +279,12 @@ class LabelGenerator:
         ]
 
     def get_instruments(self):
-        collection = self.db['crypto_candles']
+        collection = self.db[self.db_name]
         instruments = collection.distinct("instrument", {"granularity": "ONE_MINUTE"})
         return instruments
 
     def fetch_data(self, instrument):
-        collection = self.db['crypto_candles']
+        collection = self.db[self.db_name]
         cursor = collection.find({"instrument": instrument})
         df = pd.DataFrame(list(cursor))
         for column in ['close', 'high', 'low', 'volume']:
@@ -407,8 +411,28 @@ class LabelGenerator:
         collection_list = self.db.list_collection_names()  # Get the list of collection names
         exists = collection_name in collection_list  # Check if the collection name exists in the list
         return exists
-
     
+    def run(self):
+        collection_name = 'ML_features'  # The collection to save labeled data
+        instruments = self.get_instruments()
+
+        for instrument in tqdm(instruments):
+            df = self.fetch_data(instrument)
+
+            if not df.empty:
+                for granularity in self.granularities:
+                    df_granularity = df[df['granularity'] == granularity]
+
+                    for window_size in [15, 30, 45, 60]:
+                        if not df_granularity.empty:
+                            result_df = self.calculate_targets(df_granularity.copy(), window_size)
+                            result_df['instrument'] = instrument
+                            result_df['granularity'] = granularity
+                            result_df['window_size'] = window_size
+
+                            self.save_to_database(result_df, collection_name)
+                            print(f"Saved labeled data for {instrument} with granularity {granularity} and window_size {window_size} to {collection_name}.")
+
 ###
 #https://stackoverflow.com/questions/48034035/how-to-consistently-hot-encode-dataframes-with-changing-values
 class MyOneHotEncoder():

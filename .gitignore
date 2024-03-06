@@ -4,3 +4,5 @@ rapidsai-csp-utils
 backtester_pt1 - old.ipynb
 backtester_pt2 - old.ipynb
 backtester_pt2.ipynb
+helper/__pycache__/
+Logs/
