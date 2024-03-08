@@ -264,32 +264,58 @@ class DataPreparator(FeatureEngineer):
 
 ###
 class LabelGenerator:
-    def __init__(self, mongo_uri='mongodb://localhost:27017/', 
-                 db_name='crypto_data', 
-                 account_value=5000, tx_fee=0.006, profit_level=0.003):
+    def __init__(self, mongo_uri='mongodb://localhost:27017/', db_name='crypto_data', account_value=5000, tx_fee=0.006, profit_level=0.003):
         self.client = MongoClient(mongo_uri)
-        self.db_name = db_name
         self.db = self.client[db_name]
         self.account_value = account_value
         self.tx_fee = tx_fee
         self.profit_level = profit_level
-        self.granularities = [
-            "ONE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "THIRTY_MINUTE",
-            "ONE_HOUR", "TWO_HOUR", "SIX_HOUR", "ONE_DAY"
-        ]
+        self.granularities = self.get_granularities()
+
+    def get_granularities(self):
+        collection = self.db['crypto_TA']
+        try:
+            # Attempt to fetch distinct granularities
+            granularities = collection.distinct("granularity")
+            if granularities:
+                print(f"Granularities found: {granularities}")
+                return granularities
+            else:
+                print("No granularities found.")
+                return []
+        except Exception as e:
+            print(f"Error fetching granularities: {e}")
+            return []
 
     def get_instruments(self):
-        collection = self.db[self.db_name]
-        instruments = collection.distinct("instrument", {"granularity": "ONE_MINUTE"})
-        return instruments
+        collection = self.db['crypto_TA'] 
+        try:
+            # If you need to filter by granularity, consider applying a find() with a query filter first
+            instruments = collection.distinct("instrument")
+            if instruments:
+                return instruments
+            else:
+                print("No instruments found.")
+                return []
+        except Exception as e:
+            print(f"Error fetching instruments: {e}")
+            return []
 
     def fetch_data(self, instrument):
-        collection = self.db[self.db_name]
-        cursor = collection.find({"instrument": instrument})
-        df = pd.DataFrame(list(cursor))
-        for column in ['close', 'high', 'low', 'volume']:
-            df[column] = pd.to_numeric(df[column], errors='coerce')
-        return df
+        collection = self.db['crypto_TA']  # Correct collection name
+        try:
+            cursor = collection.find({"instrument": instrument})
+            df = pd.DataFrame(list(cursor))
+            if df.empty:
+                print(f"No data found for instrument {instrument}.")
+                return pd.DataFrame()  # Return an empty DataFrame for consistency
+            else:
+                for column in ['close', 'high', 'low', 'volume']:
+                    df[column] = pd.to_numeric(df[column], errors='coerce')
+                return df
+        except Exception as e:
+            print(f"Error fetching data for {instrument}: {e}")
+            return pd.DataFrame()  # Return an empty DataFrame in case of error
 
     def calculate_time_to_profit(self, df, window_size, profit_level):
         if 'close' not in df.columns or 'high' not in df.columns:
@@ -310,19 +336,6 @@ class LabelGenerator:
                 time_to_profit[i] = target_reached[0] + 1  # +1 because we start checking from i+1
 
         return time_to_profit
-    
-    def save_to_csv(self, df, filename):
-        os.makedirs('labels', exist_ok=True)
-        filepath = os.path.join('labels', filename + '.csv')
-        df.to_csv(filepath, index=False)
-        print(f"Data saved to {filepath}")
-
-    def load_from_csv(self, filename):
-        filepath = os.path.join('labels', filename + '.csv')
-        if os.path.exists(filepath):
-            return pd.read_csv(filepath)
-        else:
-            return None
         
     def calculate_targets(self, df, window_size):
         # Calculate the maximum high and minimum low of the next 'window_size' candles
@@ -387,19 +400,23 @@ class LabelGenerator:
                         result_df['granularity'] = granularity
                         result_df['window_size'] = window_size
                         yield result_df
-
-    def create_complete_index(self, df):
-        all_start_dates = pd.date_range(start=df['start'].min(), end=df['start'].max(), freq='T')
-        all_instruments = df['instrument'].unique()
-        complete_index = pd.MultiIndex.from_product([all_start_dates, all_instruments], names=['start', 'instrument'])
-        return complete_index
     
     def save_to_database(self, df, collection_name):
         collection = self.db[collection_name]
-        # Convert DataFrame to dictionary format
         records = df.to_dict("records")
-        collection.insert_many(records)
-        print(f"Data saved to collection {collection_name} in MongoDB.")
+        
+        # Prepare bulk upsert operations
+        operations = [
+            UpdateOne({'_id': record.get('_id', None)}, {'$set': record}, upsert=True)
+            for record in records
+        ]
+        
+        # Perform bulk write with upserts
+        try:
+            result = collection.bulk_write(operations)
+            print(f"Data upserted to collection {collection_name} in MongoDB. Matched: {result.matched_count}, Upserted: {result.upserted_count}")
+        except Exception as e:
+            print(f"Error upserting data to collection {collection_name}: {e}")
 
     def load_from_database(self, collection_name):
         collection = self.db[collection_name]
@@ -413,7 +430,7 @@ class LabelGenerator:
         return exists
     
     def run(self):
-        collection_name = 'ML_features'  # The collection to save labeled data
+        collection_name = 'ML_features'
         instruments = self.get_instruments()
 
         for instrument in tqdm(instruments):
@@ -423,15 +440,23 @@ class LabelGenerator:
                 for granularity in self.granularities:
                     df_granularity = df[df['granularity'] == granularity]
 
-                    for window_size in [15, 30, 45, 60]:
+                    combined_result_df = pd.DataFrame()
+                    for window_size in [15, 30, 45, 60, 120, 240, 60*24, 60*24*3]:
                         if not df_granularity.empty:
                             result_df = self.calculate_targets(df_granularity.copy(), window_size)
-                            result_df['instrument'] = instrument
-                            result_df['granularity'] = granularity
-                            result_df['window_size'] = window_size
-
-                            self.save_to_database(result_df, collection_name)
-                            print(f"Saved labeled data for {instrument} with granularity {granularity} and window_size {window_size} to {collection_name}.")
+                            if combined_result_df.empty:
+                                combined_result_df = result_df
+                            else:
+                                # Merge with suffixes to identify duplicates to drop
+                                combined_result_df = pd.merge(combined_result_df, result_df, on=['instrument', 'granularity', 'start'], how='outer', suffixes=('', '_drop_'))
+                                # Drop duplicate columns
+                                combined_result_df = combined_result_df[[c for c in combined_result_df.columns if not c.endswith('_drop_')]]
+                    
+                    if not combined_result_df.empty:
+                        combined_result_df['instrument'] = instrument
+                        combined_result_df['granularity'] = granularity
+                        self.save_to_database(combined_result_df, collection_name)
+                        print(f"Saved combined labeled data for {instrument} with granularity {granularity} to {collection_name}.")
 
 ###
 #https://stackoverflow.com/questions/48034035/how-to-consistently-hot-encode-dataframes-with-changing-values

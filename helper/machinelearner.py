@@ -5,7 +5,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
-# import xgboost as xgb
+import xgboost as xgb
 
 class MongoDBMLModelTrainer:
     def __init__(self, mongo_uri, db_name, collection_name, target_column):
@@ -18,25 +18,25 @@ class MongoDBMLModelTrainer:
         collection = self.db[self.collection_name]
         cursor = collection.find({})
         df = pd.DataFrame(list(cursor))
-        # Assuming 'time' is the column used for temporal splitting; adjust if necessary
-        if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'])
+        # Assuming 'start' is the column used for temporal splitting; adjust if necessary
+        if 'start' in df.columns:
+            df['start'] = pd.to_datetime(df['start'])
         else:
-            raise ValueError("The DataFrame does not contain a 'time' column.")
+            raise ValueError("The DataFrame does not contain a 'start' column.")
         return df
 
     def split_data(self, df):
-        df.sort_values(by='time', inplace=True)
+        df.sort_values(by='start', inplace=True)
         validation_size = int(len(df) * 0.1)
         test_size = int(len(df) * 0.2)
         validation_set = df[:validation_size]
         test_set = df[-test_size:]
         train_set = df[validation_size:-test_size]
-        X_train = train_set.drop(columns=[self.target_column, 'time'])
+        X_train = train_set.drop(columns=[self.target_column, 'start'])
         y_train = train_set[self.target_column]
-        X_validation = validation_set.drop(columns=[self.target_column, 'time'])
+        X_validation = validation_set.drop(columns=[self.target_column, 'start'])
         y_validation = validation_set[self.target_column]
-        X_test = test_set.drop(columns=[self.target_column, 'time'])
+        X_test = test_set.drop(columns=[self.target_column, 'start'])
         y_test = test_set[self.target_column]
         return X_train, X_validation, X_test, y_train, y_validation, y_test
 
